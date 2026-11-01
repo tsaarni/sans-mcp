@@ -44,23 +44,29 @@ Output:
 Server: dummy-stdio-server (1.2.3) — 4 tools
 Usage: m.tools.<tool_name>(param=value, ...)
 
-get_info()
+get_info() -> dict
     Get system info
+    Returns:
+      {os: str, version: int}
 
-get_item(*, item_id: str)
+get_item(*, item_id: str) -> dict
     Get item details by ID
     Args:
       item_id: Item identifier
+    Returns:
+      {id: str, name: str, status: str}
 
-greet_user(*, user_name: str)
+greet_user(*, user_name: str) -> str
     Greet a user by name
     Args:
       user_name: The user's name
 
-list_items(*, category: str = None)
+list_items(*, category: str = None) -> list[dict]
     List available items with optional category filter
     Args:
       category: Category filter
+    Returns:
+      list[{id: str, name: str, category: str}]
 ```
 
 ### Call Tools from Python

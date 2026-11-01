@@ -312,8 +312,11 @@ def test_stdio_transport_end_to_end():
         # Check help formatting
         help_text = m.help()
         assert "Server: dummy-stdio-server (1.2.3) — 4 tools" in help_text
-        assert "greet_user(*, user_name: str)" in help_text
-        assert "list_items(*, category: str = None)" in help_text
+        assert "greet_user(*, user_name: str) -> str" in help_text
+        assert "list_items(*, category: str = None) -> list[dict]" in help_text
+        assert "Returns:\n      list[{id: str, name: str, category: str}]" in help_text
+        assert "get_item(*, item_id: str) -> dict" in help_text
+        assert "Returns:\n      {id: str, name: str, status: str}" in help_text
 
 
 def find_free_port() -> int:

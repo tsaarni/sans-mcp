@@ -43,6 +43,9 @@ def handle_request(req: dict) -> dict | None:
                                     }
                                 },
                             },
+                            "outputSchema": {
+                                "type": "string",
+                            },
                         },
                         {
                             "name": "list-items",
@@ -54,6 +57,17 @@ def handle_request(req: dict) -> dict | None:
                                         "type": "string",
                                         "description": "Category filter",
                                     }
+                                },
+                            },
+                            "outputSchema": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": {"type": "string"},
+                                        "name": {"type": "string"},
+                                        "category": {"type": "string"},
+                                    },
                                 },
                             },
                         },
@@ -80,11 +94,26 @@ def handle_request(req: dict) -> dict | None:
                                 }
                             },
                         },
+                        "outputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string"},
+                                "name": {"type": "string"},
+                                "status": {"type": "string"},
+                            },
+                        },
                     },
                     {
                         "name": "get-info",
                         "description": "Get system info",
                         "inputSchema": {"type": "object", "properties": {}},
+                        "outputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "os": {"type": "string"},
+                                "version": {"type": "integer"},
+                            },
+                        },
                     },
                 ]
             },
