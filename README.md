@@ -1,19 +1,16 @@
-# sans-mcp
+![sans-mcp](assets/sans-mcp-logo-light.png#gh-light-mode-only)
+![sans-mcp](assets/sans-mcp-logo-dark.png#gh-dark-mode-only)
 
-`sans-mcp` is a Python module that lets coding agents use Model Context Protocol (MCP) servers through ad-hoc Python scripts, without the need to configure an MCP client in the coding agent.
+`sans-mcp` is a Python module that lets coding agents use Model Context Protocol (MCP) servers through ad-hoc Python scripts, without configuring an MCP client.
 
 - **On-demand discovery:** The coding agent can discover tool descriptions on demand, without polluting the context before they are needed.
 - **In-memory data processing:** The coding agent can process responses and chain multiple tool calls in a single Python script all in one go, without requiring an LLM round-trip for each step.
-- **Zero configuration:** The coding agent connects directly to any MCP server from ad-hoc Python scripts, without configuring an MCP client or restarting the agent.
+- **No agent configuration:** Connects directly to any MCP server from Python scripts without configuring client settings or restarting the agent.
 - **Stdio-to-HTTP proxy:** Converts stdio MCP servers to Streamable HTTP endpoints.
 - **Single-file module with no dependencies:** Uses only the Python standard library.
 
-```mermaid
-flowchart LR
-    Agent["Coding Agent"] -->|"Calls shell tool"| Script["Python Script\n(sans-mcp)"]
-    Script <-->|"Calls tools & processes data"| Server["MCP Server"]
-    Script -.->|"Final output"| Agent
-```
+![sans-mcp architecture diagram](assets/sans-mcp-diagram-light.png#gh-light-mode-only)
+![sans-mcp architecture diagram](assets/sans-mcp-diagram-dark.png#gh-dark-mode-only)
 
 ## Usage
 
@@ -89,7 +86,7 @@ Run `python3 -m sans_mcp proxy` to expose a `stdio` MCP server as a Streamable H
 python3 -m sans_mcp proxy -- npx -y @playwright/mcp
 ```
 
-To run the proxy in the background, a process runner such as [`runagent`](https://github.com/tsaarni/runagent/) can be used.
+To run the proxy in the background, a process runner such as [`runagent`](https://github.com/tsaarni/runagent/) can be used, then connect to it over HTTP:
 
 ```python
 import sans_mcp
