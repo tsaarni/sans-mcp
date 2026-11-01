@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import contextlib
+import http.client
 import http.server
 import itertools
 import json
@@ -19,6 +20,7 @@ import subprocess
 import sys
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import Callable
@@ -33,15 +35,12 @@ class SansMCPError(RuntimeError):
 
 
 def _build_ident_map(raw_names: list[str]) -> dict[str, str]:
-    """Deterministically map raw MCP wire names to unique, valid ASCII Python identifiers.
-
-    Pass 1: Exact valid ASCII identifiers claim their exact names.
-    Pass 2: Remaining names are normalized, prefixed/suffixed if needed, and deduplicated.
-    """
+    """Deterministically map raw MCP wire names to unique, valid ASCII Python identifiers."""
     mapping: dict[str, str] = {}
     claimed: set[str] = set()
 
-    # Pass 1: exact valid ASCII identifiers win first
+    # Claim exact valid identifiers first so normalized names (e.g. "a-b" -> "a_b")
+    # never collide with or shadow an existing valid name ("a_b").
     for raw in raw_names:
         if (
             raw.isascii()
@@ -52,7 +51,6 @@ def _build_ident_map(raw_names: list[str]) -> dict[str, str]:
             mapping[raw] = raw
             claimed.add(raw)
 
-    # Pass 2: normalize remaining names
     for raw in raw_names:
         if raw in mapping:
             continue
@@ -87,26 +85,24 @@ def _unwrap_result(name: str, rpc_response: dict[str, Any], wraps_result: bool =
         return result
 
     if result.get("isError"):
-        error_parts: list[str] = []
-        for item in result.get("content", []):
-            if isinstance(item, dict) and item.get("type") == "text":
-                error_parts.append(item.get("text", ""))
-            else:
-                error_parts.append(str(item))
-        error_text = "\n".join(filter(None, error_parts)).strip() or "Unknown error"
+        parts = [
+            item.get("text", "")
+            if isinstance(item, dict) and item.get("type") == "text"
+            else str(item)
+            for item in result.get("content", [])
+        ]
+        error_text = "\n".join(filter(None, parts)).strip() or "Unknown error"
         raise SansMCPError(f"Tool '{name}' failed: {error_text}")
 
-    if "structuredContent" in result and result["structuredContent"] is not None:
-        sc = result["structuredContent"]
-        if isinstance(sc, dict) and list(sc.keys()) == ["result"]:
-            if wraps_result or not isinstance(sc["result"], dict):
-                return sc["result"]
-            content = result.get("content", [])
-            if content and isinstance(content, list):
-                first_text = content[0].get("text", "") if isinstance(content[0], dict) else ""
-                trimmed = first_text.lstrip()
-                if trimmed and not (trimmed.startswith("{") and trimmed.endswith("}")):
-                    return sc["result"]
+    if (sc := result.get("structuredContent")) is not None:
+        # MCP requires structuredContent to be a JSON object, so servers like FastMCP
+        # wrap non-dict return values (lists, scalars) in {"result": <value>}.
+        if (
+            isinstance(sc, dict)
+            and list(sc.keys()) == ["result"]
+            and (wraps_result or not isinstance(sc["result"], dict))
+        ):
+            return sc["result"]
         return sc
 
     content = result.get("content", [])
@@ -117,22 +113,17 @@ def _unwrap_result(name: str, rpc_response: dict[str, Any], wraps_result: bool =
     for item in content:
         if isinstance(item, dict) and item.get("type") == "text":
             text = item.get("text", "")
-            trimmed = text.lstrip()
-            if trimmed.startswith(("{", "[")):
-                try:
+            if text.lstrip().startswith(("{", "[")):
+                with contextlib.suppress(Exception):
                     unwrapped_items.append(json.loads(text))
                     continue
-                except Exception:
-                    pass
             unwrapped_items.append(text)
         else:
             unwrapped_items.append(item)
 
-    if len(unwrapped_items) == 0:
+    if not unwrapped_items:
         return None
-    if len(unwrapped_items) == 1:
-        return unwrapped_items[0]
-    return unwrapped_items
+    return unwrapped_items[0] if len(unwrapped_items) == 1 else unwrapped_items
 
 
 class _StdioTransport:
@@ -154,16 +145,13 @@ class _StdioTransport:
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._closed = False
 
-        merged_env = os.environ.copy()
-        if env:
-            merged_env.update(env)
-
+        merged_env = {**os.environ, **(env or {})}
         try:
             self._process = subprocess.Popen(
                 command,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=None,  # inherit parent stderr
+                stderr=None,
                 text=True,
                 bufsize=1,
                 env=merged_env,
@@ -178,20 +166,16 @@ class _StdioTransport:
 
     def _read_stdout(self) -> None:
         assert self._process.stdout is not None
-        try:
+        with contextlib.suppress(Exception):
             for line in self._process.stdout:
                 self._queue.put(line)
-        except Exception:
-            pass
-        finally:
-            self._queue.put(None)
+        self._queue.put(None)
 
     def _write_line_unlocked(self, data: dict[str, Any]) -> None:
         if self._process.stdin is None or self._process.poll() is not None:
             raise SansMCPError(f"Subprocess terminated unexpectedly: {self.command!r}")
-        payload = json.dumps(data) + "\n"
         try:
-            self._process.stdin.write(payload)
+            self._process.stdin.write(json.dumps(data) + "\n")
             self._process.stdin.flush()
         except Exception as e:
             raise SansMCPError(f"Error writing to stdio process: {e}") from e
@@ -202,8 +186,9 @@ class _StdioTransport:
                 raise SansMCPError("Transport is closed")
 
             req_id = next(self._id_counter)
-            msg = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params or {}}
-            self._write_line_unlocked(msg)
+            self._write_line_unlocked(
+                {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params or {}}
+            )
 
             while True:
                 try:
@@ -228,14 +213,16 @@ class _StdioTransport:
                 except json.JSONDecodeError:
                     continue
 
-                # Auto-reply to server-initiated ping requests
-                if data.get("method") == "ping" and "id" in data:
-                    ping_reply = {"jsonrpc": "2.0", "id": data["id"], "result": {}}
-                    with contextlib.suppress(Exception):
-                        self._write_line_unlocked(ping_reply)
+                if not isinstance(data, dict):
                     continue
 
-                # Server notifications
+                if data.get("method") == "ping" and "id" in data:
+                    with contextlib.suppress(Exception):
+                        self._write_line_unlocked(
+                            {"jsonrpc": "2.0", "id": data["id"], "result": {}}
+                        )
+                    continue
+
                 if "method" in data and "id" not in data:
                     if (
                         data["method"] == "notifications/tools/list_changed"
@@ -245,22 +232,21 @@ class _StdioTransport:
                             self.on_list_changed()
                     continue
 
-                # Response matching our request id
-                if "id" in data and data["id"] == req_id:
+                if data.get("id") == req_id:
                     return data
 
     def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
         with self._lock:
             if self._closed:
                 raise SansMCPError("Transport is closed")
-            msg = {"jsonrpc": "2.0", "method": method, "params": params or {}}
-            self._write_line_unlocked(msg)
+            self._write_line_unlocked({"jsonrpc": "2.0", "method": method, "params": params or {}})
 
     def close(self) -> None:
         with self._lock:
             if self._closed:
                 return
             self._closed = True
+            atexit.unregister(self.close)
 
             if self._process.stdin:
                 with contextlib.suppress(Exception):
@@ -273,6 +259,138 @@ class _StdioTransport:
                 except Exception:
                     with contextlib.suppress(Exception):
                         self._process.kill()
+                        self._process.wait(timeout=1)
+
+            if self._process.stdout:
+                with contextlib.suppress(Exception):
+                    self._process.stdout.close()
+
+
+def _is_loopback_host(hostname: str) -> bool:
+    h = hostname.lower().strip("[]")
+    return (
+        h in ("localhost", "127.0.0.1", "::1") or h.startswith("127.") or h.endswith(".localhost")
+    )
+
+
+def _auth_config_path() -> str:
+    config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(config_home, "sans-mcp", "auth.json")
+
+
+def _load_auth_headers(url: str) -> dict[str, str]:
+    auth_path = _auth_config_path()
+    if not os.path.exists(auth_path):
+        return {}
+
+    if os.name == "posix":
+        mode = os.stat(auth_path).st_mode & 0o777
+        if mode & 0o077:
+            raise SansMCPError(
+                f"Insecure permissions {oct(mode)} on '{auth_path}'; "
+                f"expected 0o600 (run: chmod 600 {shlex.quote(auth_path)})"
+            )
+
+    try:
+        with open(auth_path, encoding="utf-8") as f:
+            raw_config = json.load(f)
+    except Exception as e:
+        raise SansMCPError(f"Failed to parse auth config '{auth_path}': {e}") from e
+
+    if not isinstance(raw_config, dict):
+        raise SansMCPError(
+            f"Invalid auth config in '{auth_path}': top-level value must be a JSON object"
+        )
+
+    parsed = urllib.parse.urlsplit(url)
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        return {}
+
+    config_by_host = {str(k).lower(): (k, v) for k, v in raw_config.items()}
+    candidates = (
+        *([f"[{hostname}]:{parsed.port}", f"{hostname}:{parsed.port}"] if parsed.port else []),
+        f"[{hostname}]",
+        hostname,
+    )
+    matched = next((config_by_host[c] for c in candidates if c in config_by_host), None)
+    if matched is None:
+        return {}
+
+    matched_key, matched_headers = matched
+    if not isinstance(matched_headers, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in matched_headers.items()
+    ):
+        raise SansMCPError(
+            f"Invalid auth config for '{matched_key}' in '{auth_path}': "
+            "expected an object mapping header names to string values"
+        )
+
+    def replace_env(match: re.Match[str]) -> str:
+        var_name = match.group(1)
+        val = os.environ.get(var_name)
+        if not val:
+            raise SansMCPError(
+                f"Environment variable '{var_name}' referenced in '{auth_path}' "
+                f"for '{matched_key}' is not set"
+            )
+        return val
+
+    return {
+        h_name: re.sub(r"\$\{([^}]+)\}", replace_env, h_val)
+        for h_name, h_val in matched_headers.items()
+    }
+
+
+def _url_origin(url: str) -> tuple[str, str, int | None]:
+    parts = urllib.parse.urlsplit(url)
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").lower()
+    port = parts.port or (443 if scheme == "https" else 80 if scheme == "http" else None)
+    return (scheme, host, port)
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Redirect handler that blocks HTTPS downgrades and strips credentials cross-origin."""
+
+    _SAFE_HEADERS = frozenset({"accept", "content-length", "content-type", "host", "user-agent"})
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        orig_origin = _url_origin(req.full_url)
+        new_origin = _url_origin(newurl)
+        if orig_origin[0] == "https" and new_origin[0] != "https":
+            raise SansMCPError(
+                f"Refusing redirect from HTTPS '{req.full_url}' to plaintext HTTP '{newurl}'"
+            )
+
+        if code in (307, 308) and req.get_method() == "POST":
+            new_req: urllib.request.Request | None = urllib.request.Request(
+                newurl.replace(" ", "%20"),
+                data=req.data,
+                headers=dict(req.headers),
+                origin_req_host=req.origin_req_host,
+                unverifiable=True,
+                method="POST",
+            )
+        else:
+            new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+        assert new_req is not None
+
+        if orig_origin != new_origin:
+            for hdr_dict in (new_req.headers, new_req.unredirected_hdrs):
+                for k in list(hdr_dict.keys()):
+                    if k.lower() not in self._SAFE_HEADERS:
+                        del hdr_dict[k]
+
+        return new_req
 
 
 class _HttpTransport:
@@ -286,112 +404,100 @@ class _HttpTransport:
     ) -> None:
         self.url = url
         self.timeout = timeout
-        self.custom_headers = headers or {}
+        resolved_headers = _load_auth_headers(url)
+        if headers:
+            override_lower = {k.lower() for k in headers}
+            resolved_headers = {
+                k: v for k, v in resolved_headers.items() if k.lower() not in override_lower
+            }
+            resolved_headers.update(headers)
+        self.custom_headers = resolved_headers
+
+        if self.custom_headers:
+            parsed = urllib.parse.urlsplit(url)
+            if parsed.scheme.lower() != "https" and not _is_loopback_host(parsed.hostname or ""):
+                raise SansMCPError(
+                    f"Refusing to send authentication headers over plaintext HTTP "
+                    f"to non-loopback host '{parsed.hostname}'"
+                )
+
         self.session_id: str | None = None
         self._id_counter = itertools.count(1)
         self._lock = threading.Lock()
+        self._opener = urllib.request.build_opener(_SafeRedirectHandler())
 
     def _parse_sse_response(self, resp: Any, target_id: Any) -> dict[str, Any]:
         buffer: list[str] = []
-        for raw_line in resp:
+        for raw_line in itertools.chain(resp, [b"\n"]):
             line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
-            if not line:
-                if buffer:
-                    chunk = "\n".join(buffer)
-                    buffer.clear()
-                    try:
-                        data = json.loads(chunk)
-                        if data.get("id") == target_id:
-                            return data
-                    except json.JSONDecodeError:
-                        pass
-                continue
-
             if line.startswith("data:"):
                 buffer.append(line[5:].lstrip())
-
-        if buffer:
-            chunk = "\n".join(buffer)
-            try:
-                data = json.loads(chunk)
-                if data.get("id") == target_id:
-                    return data
-            except json.JSONDecodeError:
-                pass
-
+            elif not line and buffer:
+                chunk = "\n".join(buffer)
+                buffer.clear()
+                with contextlib.suppress(json.JSONDecodeError):
+                    data = json.loads(chunk)
+                    if isinstance(data, dict) and data.get("id") == target_id:
+                        return data
         raise SansMCPError(f"SSE stream ended without response for request id={target_id}")
 
-    def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _send(
+        self, payload: dict[str, Any], req_id: int | None = None, label: str = ""
+    ) -> dict[str, Any]:
         with self._lock:
-            req_id = next(self._id_counter)
-            payload = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params or {}}
             body_bytes = json.dumps(payload).encode("utf-8")
-
             req_headers = {
                 "Content-Type": "application/json",
                 "Accept": "application/json, text/event-stream",
+                **self.custom_headers,
             }
-            req_headers.update(self.custom_headers)
             if self.session_id:
                 req_headers["mcp-session-id"] = self.session_id
 
             req = urllib.request.Request(
                 self.url, data=body_bytes, headers=req_headers, method="POST"
             )
-
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                with self._opener.open(req, timeout=self.timeout) as resp:
                     for h_name, h_val in resp.headers.items():
                         if h_name.lower() == "mcp-session-id":
                             self.session_id = h_val
 
+                    if req_id is None:
+                        return {}
+
                     content_type = resp.headers.get("Content-Type", "")
                     if "text/event-stream" in content_type:
                         return self._parse_sse_response(resp, req_id)
-                    else:
-                        resp_bytes = resp.read()
-                        if not resp_bytes:
-                            return {"jsonrpc": "2.0", "id": req_id, "result": {}}
-                        return json.loads(resp_bytes.decode("utf-8"))
+
+                    resp_bytes = resp.read()
+                    if not resp_bytes:
+                        return {"jsonrpc": "2.0", "id": req_id, "result": {}}
+                    return json.loads(resp_bytes.decode("utf-8"))
             except urllib.error.HTTPError as e:
-                err_body = e.read().decode("utf-8", errors="replace")
+                try:
+                    err_body = e.read().decode("utf-8", errors="replace")
+                except OSError:
+                    err_body = str(e.reason)
                 if e.code in (404, 405) and "/sse" in self.url:
                     raise SansMCPError(
                         f"HTTP {e.code} connecting to '{self.url}': Server may require legacy MCP SSE "
                         f"transport, which is deprecated in favor of Streamable HTTP ({err_body})"
                     ) from e
-                raise SansMCPError(f"HTTP {e.code} error calling '{method}': {err_body}") from e
+                raise SansMCPError(f"HTTP {e.code} error {label}: {err_body}") from e
             except urllib.error.URLError as e:
                 raise SansMCPError(f"Failed to connect to '{self.url}': {e.reason}") from e
+            except (http.client.HTTPException, OSError, json.JSONDecodeError) as e:
+                raise SansMCPError(f"Error communicating with '{self.url}': {e}") from e
+
+    def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        req_id = next(self._id_counter)
+        payload = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params or {}}
+        return self._send(payload, req_id=req_id, label=f"calling '{method}'")
 
     def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
-        with self._lock:
-            payload = {"jsonrpc": "2.0", "method": method, "params": params or {}}
-            body_bytes = json.dumps(payload).encode("utf-8")
-
-            req_headers = {
-                "Content-Type": "application/json",
-                "Accept": "application/json, text/event-stream",
-            }
-            req_headers.update(self.custom_headers)
-            if self.session_id:
-                req_headers["mcp-session-id"] = self.session_id
-
-            req = urllib.request.Request(
-                self.url, data=body_bytes, headers=req_headers, method="POST"
-            )
-            try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                    for h_name, h_val in resp.headers.items():
-                        if h_name.lower() == "mcp-session-id":
-                            self.session_id = h_val
-            except urllib.error.HTTPError as e:
-                err_body = e.read().decode("utf-8", errors="replace")
-                raise SansMCPError(
-                    f"HTTP {e.code} error in notification '{method}': {err_body}"
-                ) from e
-            except urllib.error.URLError as e:
-                raise SansMCPError(f"Failed to connect to '{self.url}': {e.reason}") from e
+        payload = {"jsonrpc": "2.0", "method": method, "params": params or {}}
+        self._send(payload, req_id=None, label=f"in notification '{method}'")
 
     def close(self) -> None:
         pass
@@ -399,17 +505,12 @@ class _HttpTransport:
 
 def _resolve_schema_ref(schema: dict[str, Any], defs: dict[str, Any]) -> dict[str, Any]:
     ref = schema.get("$ref")
-    if ref and isinstance(ref, str):
-        # Resolve #/$defs/Name or #/definitions/Name
+    if isinstance(ref, str):
         parts = ref.lstrip("#/").split("/")
         if len(parts) >= 2 and parts[0] in ("$defs", "definitions"):
             target_def = defs.get(parts[1])
             if isinstance(target_def, dict):
-                merged = target_def.copy()
-                for k, v in schema.items():
-                    if k != "$ref":
-                        merged[k] = v
-                return merged
+                return {**target_def, **{k: v for k, v in schema.items() if k != "$ref"}}
     return schema
 
 
@@ -419,9 +520,8 @@ def _format_type(schema: dict[str, Any] | None, defs: dict[str, Any]) -> str:
 
     schema = _resolve_schema_ref(schema, defs)
 
-    # anyOf / oneOf
     union_schemas = schema.get("anyOf") or schema.get("oneOf")
-    if union_schemas and isinstance(union_schemas, list):
+    if isinstance(union_schemas, list) and union_schemas:
         sub_types: list[str] = []
         has_null = False
         for s in union_schemas:
@@ -434,26 +534,24 @@ def _format_type(schema: dict[str, Any] | None, defs: dict[str, Any]) -> str:
         base = " | ".join(sub_types) if sub_types else "Any"
         return f"{base} | None" if has_null else base
 
-    # Enum
     enum_vals = schema.get("enum")
-    if enum_vals and isinstance(enum_vals, list) and len(enum_vals) <= 5:
+    if isinstance(enum_vals, list) and 0 < len(enum_vals) <= 5:
         return f"Literal[{', '.join(repr(v) for v in enum_vals)}]"
 
     t = schema.get("type")
-    if t == "string":
-        return "str"
-    elif t == "integer":
-        return "int"
-    elif t == "number":
-        return "float"
-    elif t == "boolean":
-        return "bool"
-    elif t == "array":
+    type_map = {
+        "string": "str",
+        "integer": "int",
+        "number": "float",
+        "boolean": "bool",
+        "object": "dict",
+    }
+    if t in type_map:
+        return type_map[t]
+    if t == "array":
         item_schema = schema.get("items")
         item_type = _format_type(item_schema, defs) if isinstance(item_schema, dict) else "Any"
         return f"list[{item_type}]"
-    elif t == "object":
-        return "dict"
 
     return "Any"
 
@@ -461,7 +559,7 @@ def _format_type(schema: dict[str, Any] | None, defs: dict[str, Any]) -> str:
 def _format_object_fields_preview(schema: dict[str, Any], defs: dict[str, Any]) -> str:
     schema = _resolve_schema_ref(schema, defs)
     props = schema.get("properties")
-    if not props or not isinstance(props, dict):
+    if not isinstance(props, dict) or not props:
         return "dict"
     fields = [f"{k}: {_format_type(v, defs)}" for k, v in props.items()]
     return "{" + ", ".join(fields) + "}"
@@ -469,19 +567,15 @@ def _format_object_fields_preview(schema: dict[str, Any], defs: dict[str, Any]) 
 
 @dataclass
 class _ToolSpec:
-    raw: dict[str, Any]
     py_name: str
     wire_name: str
     py_to_wire_params: dict[str, str] = field(default_factory=dict)
-    wire_to_py_params: dict[str, str] = field(default_factory=dict)
     required_py_params: set[str] = field(default_factory=set)
-    param_types: dict[str, str] = field(default_factory=dict)
-    param_defaults: dict[str, Any] = field(default_factory=dict)
-    param_docs: dict[str, str] = field(default_factory=dict)
     return_type: str = "Any"
-    return_doc: str = ""
     closed_properties: bool = True
     wraps_result: bool = False
+    signature: str = ""
+    help_text: str = ""
 
 
 def _build_tool_spec(tool_dict: dict[str, Any], py_name: str) -> _ToolSpec:
@@ -491,119 +585,77 @@ def _build_tool_spec(tool_dict: dict[str, Any], py_name: str) -> _ToolSpec:
     raw_props = input_schema.get("properties") or {}
     required_raw = set(input_schema.get("required") or [])
 
-    # Map parameters
     wire_to_py = _build_ident_map(list(raw_props.keys()))
     py_to_wire = {v: k for k, v in wire_to_py.items()}
 
     required_py: set[str] = set()
-    param_types: dict[str, str] = {}
-    param_defaults: dict[str, Any] = {}
-    param_docs: dict[str, str] = {}
+    req_parts: list[str] = []
+    opt_parts: list[str] = []
+    arg_docs: list[str] = []
 
     for wire_param, py_param in wire_to_py.items():
         p_schema = raw_props.get(wire_param, {})
         p_type = _format_type(p_schema, defs)
-        param_types[py_param] = p_type
-
         if "default" in p_schema:
-            param_defaults[py_param] = p_schema["default"]
+            opt_parts.append(f"{py_param}: {p_type} = {p_schema['default']!r}")
         elif wire_param in required_raw:
             required_py.add(py_param)
+            req_parts.append(f"{py_param}: {p_type}")
         else:
-            param_defaults[py_param] = None
+            opt_parts.append(f"{py_param}: {p_type} = None")
 
-        desc = p_schema.get("description", "").strip()
-        if desc:
-            param_docs[py_param] = desc
+        if desc := p_schema.get("description", "").strip():
+            arg_docs.append(f"      {py_param}: {desc}")
 
-    # Return type & outputSchema
     output_schema = tool_dict.get("outputSchema")
     wraps_result = False
     return_type = "Any"
     return_doc = ""
 
-    if output_schema and isinstance(output_schema, dict):
+    if isinstance(output_schema, dict) and output_schema:
         out_defs = output_schema.get("$defs") or output_schema.get("definitions") or {}
-        out_props = output_schema.get("properties") or {}
-        if output_schema.get("type") == "object" and list(out_props.keys()) == ["result"]:
+        resolved_out = _resolve_schema_ref(output_schema, out_defs)
+        out_props = resolved_out.get("properties") or {}
+        if resolved_out.get("type") == "object" and list(out_props.keys()) == ["result"]:
             wraps_result = True
-            inner_schema = out_props["result"]
-            return_type = _format_type(inner_schema, out_defs)
-            if inner_schema.get("type") == "array" and isinstance(inner_schema.get("items"), dict):
-                item_schema = inner_schema["items"]
-                if item_schema.get("type") == "object" and item_schema.get("properties"):
-                    return_doc = f"list[{_format_object_fields_preview(item_schema, out_defs)}]"
-            elif inner_schema.get("type") == "object" and inner_schema.get("properties"):
-                return_doc = _format_object_fields_preview(inner_schema, out_defs)
+            target_schema = _resolve_schema_ref(out_props["result"], out_defs)
         else:
-            return_type = _format_type(output_schema, out_defs)
-            if output_schema.get("type") == "object" and output_schema.get("properties"):
-                return_doc = _format_object_fields_preview(output_schema, out_defs)
+            target_schema = resolved_out
 
-    additional_props = input_schema.get("additionalProperties")
-    closed = additional_props is not True
+        return_type = _format_type(target_schema, out_defs)
+        if target_schema.get("type") == "array" and isinstance(target_schema.get("items"), dict):
+            item_schema = _resolve_schema_ref(target_schema["items"], out_defs)
+            if item_schema.get("type") == "object" and item_schema.get("properties"):
+                return_doc = f"list[{_format_object_fields_preview(item_schema, out_defs)}]"
+        elif target_schema.get("type") == "object" and target_schema.get("properties"):
+            return_doc = _format_object_fields_preview(target_schema, out_defs)
+
+    params = ", ".join(req_parts + opt_parts)
+    sig = f"{py_name}(*, {params})" if params else f"{py_name}()"
+    if return_type != "Any":
+        sig = f"{sig} -> {return_type}"
+
+    lines = [sig]
+    if raw_desc := tool_dict.get("description", "").strip():
+        lines.extend(f"    {d_line.strip()}" for d_line in raw_desc.splitlines())
+    if arg_docs:
+        lines.append("    Args:")
+        lines.extend(arg_docs)
+    if return_doc:
+        lines.append("    Returns:")
+        lines.append(f"      {return_doc}")
 
     return _ToolSpec(
-        raw=tool_dict,
         py_name=py_name,
         wire_name=wire_name,
         py_to_wire_params=py_to_wire,
-        wire_to_py_params=wire_to_py,
         required_py_params=required_py,
-        param_types=param_types,
-        param_defaults=param_defaults,
-        param_docs=param_docs,
         return_type=return_type,
-        return_doc=return_doc,
-        closed_properties=closed,
+        closed_properties=input_schema.get("additionalProperties") is not True,
         wraps_result=wraps_result,
+        signature=sig,
+        help_text="\n".join(lines),
     )
-
-
-def _format_signature(tool: _ToolSpec) -> str:
-    params_str_list: list[str] = []
-
-    # Required params first
-    for p in tool.py_to_wire_params:
-        if p in tool.required_py_params:
-            t = tool.param_types.get(p, "Any")
-            params_str_list.append(f"{p}: {t}")
-
-    # Optional params next
-    for p in tool.py_to_wire_params:
-        if p not in tool.required_py_params:
-            t = tool.param_types.get(p, "Any")
-            val = tool.param_defaults.get(p)
-            params_str_list.append(f"{p}: {t} = {val!r}")
-
-    if params_str_list:
-        sig = f"{tool.py_name}(*, {', '.join(params_str_list)})"
-    else:
-        sig = f"{tool.py_name}()"
-
-    if tool.return_type != "Any":
-        sig += f" -> {tool.return_type}"
-    return sig
-
-
-def _format_tool_help(tool: _ToolSpec) -> str:
-    lines: list[str] = [_format_signature(tool)]
-
-    raw_desc = tool.raw.get("description", "").strip()
-    if raw_desc:
-        for d_line in raw_desc.splitlines():
-            lines.append(f"    {d_line.strip()}")
-
-    if tool.param_docs:
-        lines.append("    Args:")
-        for p, doc in tool.param_docs.items():
-            lines.append(f"      {p}: {doc}")
-
-    if tool.return_doc:
-        lines.append("    Returns:")
-        lines.append(f"      {tool.return_doc}")
-
-    return "\n".join(lines)
 
 
 def _format_help(
@@ -619,16 +671,43 @@ def _format_help(
         matched = [t for t in tools if t.py_name == tool_name or t.wire_name == tool_name]
         if not matched:
             raise SansMCPError(f"Tool '{tool_name}' not found on server '{name}'.")
-        return _format_tool_help(matched[0])
+        return matched[0].help_text
 
     count_str = f"{len(tools)} tool" if len(tools) == 1 else f"{len(tools)} tools"
-    header = [
-        f"Server: {name}{ver_str} — {count_str}",
-        "Usage: m.tools.<tool_name>(param=value, ...)",
-        "",
-    ]
-    tool_blocks = [_format_tool_help(t) for t in sorted(tools, key=lambda x: x.py_name)]
-    return "\n".join(header) + "\n\n".join(tool_blocks)
+    header = (
+        f"Server: {name}{ver_str} — {count_str}\nUsage: m.tools.<tool_name>(param=value, ...)\n\n"
+    )
+    return header + "\n\n".join(t.help_text for t in sorted(tools, key=lambda x: x.py_name))
+
+
+def _initialize_mcp(transport: Any, client_name: str = "sans-mcp") -> dict[str, Any]:
+    init_res = transport.request(
+        "initialize",
+        {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": client_name, "version": "0.1.0"},
+        },
+    )
+    if "error" in init_res:
+        raise SansMCPError(f"Initialization handshake failed: {init_res['error']}")
+    transport.notify("notifications/initialized", {})
+    return init_res.get("result", {})
+
+
+def _fetch_tools(transport: Any) -> list[dict[str, Any]]:
+    all_tools: list[dict[str, Any]] = []
+    cursor: str | None = None
+    while True:
+        res = transport.request("tools/list", {"cursor": cursor} if cursor else {})
+        if "error" in res:
+            raise SansMCPError(f"Failed to list tools: {res['error']}")
+        result = res.get("result", {})
+        all_tools.extend(result.get("tools", []))
+        cursor = result.get("nextCursor")
+        if not cursor:
+            break
+    return all_tools
 
 
 class _ToolsProxy:
@@ -650,38 +729,27 @@ class _ToolsProxy:
 
         def call_tool(*args: Any, **kwargs: Any) -> Any:
             if args:
-                sig = _format_signature(spec)
                 raise TypeError(
-                    f"MCP tool '{py_name}' only accepts keyword arguments: m.tools.{sig}"
+                    f"MCP tool '{py_name}' only accepts keyword arguments: m.tools.{spec.signature}"
                 )
 
-            # Validate missing required parameters
-            missing = spec.required_py_params - set(kwargs.keys())
-            if missing:
-                sig = _format_signature(spec)
+            if missing := spec.required_py_params - set(kwargs.keys()):
                 missing_str = ", ".join(sorted(missing))
                 raise TypeError(
                     f"MCP tool '{py_name}' missing required argument(s): {missing_str}. "
-                    f"Expected signature: m.tools.{sig}"
+                    f"Expected signature: m.tools.{spec.signature}"
                 )
 
-            # Validate unknown parameters if closed
-            if spec.closed_properties:
-                unknown = set(kwargs.keys()) - set(spec.py_to_wire_params.keys())
-                if unknown:
-                    sig = _format_signature(spec)
-                    unknown_str = ", ".join(sorted(unknown))
-                    raise TypeError(
-                        f"MCP tool '{py_name}' got unexpected keyword argument(s): {unknown_str}. "
-                        f"Expected signature: m.tools.{sig}"
-                    )
+            if spec.closed_properties and (
+                unknown := set(kwargs.keys()) - set(spec.py_to_wire_params.keys())
+            ):
+                unknown_str = ", ".join(sorted(unknown))
+                raise TypeError(
+                    f"MCP tool '{py_name}' got unexpected keyword argument(s): {unknown_str}. "
+                    f"Expected signature: m.tools.{spec.signature}"
+                )
 
-            # Translate Python kwargs to raw wire arguments
-            wire_kwargs: dict[str, Any] = {}
-            for k, v in kwargs.items():
-                wire_key = spec.py_to_wire_params.get(k, k)
-                wire_kwargs[wire_key] = v
-
+            wire_kwargs = {spec.py_to_wire_params.get(k, k): v for k, v in kwargs.items()}
             return self._client._call_tool(spec.wire_name, wire_kwargs, spec.wraps_result)
 
         return call_tool
@@ -692,71 +760,33 @@ class SansMCP:
 
     tools: _ToolsProxy
 
-    def __init__(
-        self,
-        transport: _StdioTransport | _HttpTransport,
-        target_name: str = "",
-    ) -> None:
+    def __init__(self, transport: _StdioTransport | _HttpTransport) -> None:
         self._transport = transport
-        self._target_name = target_name
         self._server_info: dict[str, Any] = {}
         self._tools: dict[str, _ToolSpec] = {}
         self.tools = _ToolsProxy(self, self._tools)
-        self._init_session()
+        try:
+            self._init_session()
+        except Exception:
+            self._transport.close()
+            raise
 
     def _init_session(self) -> None:
-        init_res = self._transport.request(
-            "initialize",
-            {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "sans-mcp", "version": "0.1.0"},
-            },
-        )
-        if "error" in init_res:
-            err = init_res["error"]
-            raise SansMCPError(f"Initialization handshake failed: {err}")
-
-        result = init_res.get("result", {})
+        result = _initialize_mcp(self._transport, client_name="sans-mcp")
         self._server_info = result.get("serverInfo", {})
-
-        self._transport.notify("notifications/initialized", {})
         self._load_tools()
 
     def _load_tools(self) -> None:
-        raw_tools = self._list_tools()
-        raw_names = [t.get("name", "") for t in raw_tools]
-        ident_map = _build_ident_map(raw_names)
+        raw_tools = _fetch_tools(self._transport)
+        ident_map = _build_ident_map([t.get("name", "") for t in raw_tools])
 
         self._tools.clear()
         for t in raw_tools:
             wire_name = t.get("name", "")
             py_name = ident_map.get(wire_name, wire_name)
-            spec = _build_tool_spec(t, py_name)
-            self._tools[py_name] = spec
+            self._tools[py_name] = _build_tool_spec(t, py_name)
 
         self.tools = _ToolsProxy(self, self._tools)
-
-    def _list_tools(self) -> list[dict[str, Any]]:
-        all_tools: list[dict[str, Any]] = []
-        cursor: str | None = None
-
-        while True:
-            params = {"cursor": cursor} if cursor else {}
-            res = self._transport.request("tools/list", params)
-            if "error" in res:
-                err = res["error"]
-                raise SansMCPError(f"Failed to list tools: {err}")
-
-            result = res.get("result", {})
-            tools = result.get("tools", [])
-            all_tools.extend(tools)
-
-            cursor = result.get("nextCursor")
-            if not cursor:
-                break
-
-        return all_tools
 
     def _call_tool(
         self, wire_name: str, wire_arguments: dict[str, Any], wraps_result: bool = False
@@ -800,105 +830,91 @@ def connect(
 ) -> SansMCP:
     """Connect to an MCP server via Streamable HTTP (URL) or ephemeral stdio command."""
     if isinstance(target, str) and target.startswith(("http://", "https://")):
-        transport = _HttpTransport(target, timeout=timeout, headers=headers)
-        return SansMCP(transport, target_name=target)
+        return SansMCP(_HttpTransport(target, timeout=timeout, headers=headers))
 
     cmd = shlex.split(target) if isinstance(target, str) else list(target)
     if not cmd:
         raise SansMCPError("Empty target command specified")
 
-    transport = _StdioTransport(cmd, timeout=timeout, env=env, cwd=cwd)
-    return SansMCP(transport, target_name=str(target))
+    return SansMCP(_StdioTransport(cmd, timeout=timeout, env=env, cwd=cwd))
 
 
-def _run_proxy(host: str, port: int, command: list[str]) -> None:
-    """Run persistent HTTP proxy caching initialize and tools/list in memory."""
-    print(f"[sans-mcp] Spawning child stdio process: {command!r}", file=sys.stderr)
-
+def _create_proxy_server(
+    host: str, port: int, transport: Any
+) -> tuple[http.server.ThreadingHTTPServer, dict[str, Any]]:
+    """Initialize MCP session on transport and return a configured ThreadingHTTPServer."""
     tools_lock = threading.Lock()
-    cached_tools_res: dict[str, Any] = {}
+    cached_tools_res: dict[str, Any] | None = None
 
-    def refresh_tools() -> None:
+    def invalidate_tools() -> None:
+        nonlocal cached_tools_res
+        cached_tools_res = None
+
+    def get_tools_res() -> dict[str, Any]:
         nonlocal cached_tools_res
         with tools_lock:
-            all_tools: list[dict[str, Any]] = []
-            cursor: str | None = None
-            while True:
-                params = {"cursor": cursor} if cursor else {}
-                res = transport.request("tools/list", params)
-                tools = res.get("result", {}).get("tools", [])
-                all_tools.extend(tools)
-                cursor = res.get("result", {}).get("nextCursor")
-                if not cursor:
-                    break
-            cached_tools_res = {"tools": all_tools}
+            if cached_tools_res is None:
+                cached_tools_res = {"tools": _fetch_tools(transport)}
+            return cached_tools_res
 
-    transport = _StdioTransport(
-        command,
-        timeout=120.0,
-        on_list_changed=refresh_tools,
-    )
-
-    try:
-        init_res = transport.request(
-            "initialize",
-            {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "sans-mcp-gateway", "version": "0.1.0"},
-            },
-        )
-        transport.notify("notifications/initialized", {})
-        refresh_tools()
-    except Exception as e:
-        transport.close()
-        print(f"[sans-mcp] Startup handshake failed: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    cached_init_result = init_res.get("result", {})
+    transport.on_list_changed = invalidate_tools
+    cached_init_result = _initialize_mcp(transport, client_name="sans-mcp-gateway")
+    initial_tools = get_tools_res()
     gateway_session_id = str(uuid.uuid4())
 
     class GatewayHandler(http.server.BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:
-            # Suppress default request logging to keep stderr clean
             pass
 
-        def do_GET(self) -> None:
-            server_info = cached_init_result.get("serverInfo", {})
-            with tools_lock:
-                tool_count = len(cached_tools_res.get("tools", []))
-            data = {
-                "status": "ok",
-                "session_id": gateway_session_id,
-                "serverInfo": server_info,
-                "tools_count": tool_count,
-            }
-            body = json.dumps(data).encode("utf-8")
-            self.send_response(200)
+        def _send_json(self, status: int, payload: dict[str, Any]) -> None:
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("mcp-session-id", gateway_session_id)
             self.end_headers()
             self.wfile.write(body)
 
-        def do_POST(self) -> None:
-            length = int(self.headers.get("Content-Length", 0))
-            raw_body = self.rfile.read(length)
+        def do_GET(self) -> None:
+            self._send_json(
+                200,
+                {
+                    "status": "ok",
+                    "session_id": gateway_session_id,
+                    "serverInfo": cached_init_result.get("serverInfo", {}),
+                    "tools_count": len(get_tools_res().get("tools", [])),
+                },
+            )
 
-            try:
-                rpc_req = json.loads(raw_body.decode("utf-8")) if raw_body else {}
-            except Exception:
-                self.send_response(400)
-                self.end_headers()
-                self.wfile.write(
-                    b'{"jsonrpc":"2.0","error":{"code":-32700,"message":"Parse error"}}'
+        def do_POST(self) -> None:
+            if "Origin" in self.headers:
+                self._send_json(
+                    403,
+                    {"jsonrpc": "2.0", "error": {"code": -32600, "message": "Origin not allowed"}},
                 )
                 return
 
-            method = rpc_req.get("method")
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                raw_body = self.rfile.read(length) if length > 0 else b""
+                rpc_req = json.loads(raw_body.decode("utf-8"))
+            except Exception:
+                self._send_json(
+                    400,
+                    {"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}},
+                )
+                return
+
+            if not isinstance(rpc_req, dict) or not isinstance(rpc_req.get("method"), str):
+                self._send_json(
+                    400,
+                    {"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid Request"}},
+                )
+                return
+
+            method = rpc_req["method"]
             req_id = rpc_req.get("id")
 
-            # Notifications (no id)
             if "id" not in rpc_req:
                 if method != "notifications/initialized":
                     with contextlib.suppress(Exception):
@@ -908,18 +924,16 @@ def _run_proxy(host: str, port: int, command: list[str]) -> None:
                 self.end_headers()
                 return
 
-            # Requests
             if method == "initialize":
                 resp_payload = {"jsonrpc": "2.0", "id": req_id, "result": cached_init_result}
             elif method == "tools/list":
-                with tools_lock:
-                    resp_payload = {"jsonrpc": "2.0", "id": req_id, "result": cached_tools_res}
+                resp_payload = {"jsonrpc": "2.0", "id": req_id, "result": get_tools_res()}
             elif method == "ping":
                 resp_payload = {"jsonrpc": "2.0", "id": req_id, "result": {}}
             else:
                 try:
                     resp_payload = transport.request(method, rpc_req.get("params"))
-                    resp_payload["id"] = req_id  # ensure ID aligns with caller
+                    resp_payload["id"] = req_id
                 except Exception as e:
                     resp_payload = {
                         "jsonrpc": "2.0",
@@ -927,22 +941,30 @@ def _run_proxy(host: str, port: int, command: list[str]) -> None:
                         "error": {"code": -32603, "message": str(e)},
                     }
 
-            resp_bytes = json.dumps(resp_payload).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(resp_bytes)))
-            self.send_header("mcp-session-id", gateway_session_id)
-            self.end_headers()
-            self.wfile.write(resp_bytes)
+            self._send_json(200, resp_payload)
 
     class ThreadedServer(http.server.ThreadingHTTPServer):
         daemon_threads = True
         allow_reuse_address = True
 
-    httpd = ThreadedServer((host, port), GatewayHandler)
+    return ThreadedServer((host, port), GatewayHandler), initial_tools
+
+
+def _run_proxy(host: str, port: int, command: list[str]) -> None:
+    """Run persistent HTTP proxy caching initialize and tools/list in memory."""
+    print(f"[sans-mcp] Spawning child stdio process: {command!r}", file=sys.stderr)
+    transport = _StdioTransport(command, timeout=120.0)
+
+    try:
+        httpd, initial_tools = _create_proxy_server(host, port, transport)
+    except Exception as e:
+        transport.close()
+        print(f"[sans-mcp] Startup handshake failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
     print(
         f"[sans-mcp] HTTP proxy running on http://{host}:{port}/mcp "
-        f"({len(cached_tools_res.get('tools', []))} tools cached)",
+        f"({len(initial_tools.get('tools', []))} tools cached)",
         file=sys.stderr,
     )
 
@@ -989,14 +1011,12 @@ def main(argv: list[str] | None = None) -> None:
     )
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
 
-    # help subcommand
     help_parser = subparsers.add_parser("help", help="Discover tools and print signatures")
     help_parser.add_argument("target", help="Connection target (URL or stdio command string)")
     help_parser.add_argument(
         "tool_name", nargs="?", default=None, help="Optional specific tool name"
     )
 
-    # proxy subcommand
     proxy_parser = subparsers.add_parser("proxy", help="Proxy child stdio server over HTTP")
     proxy_parser.add_argument(
         "--listen",

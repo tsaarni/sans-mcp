@@ -17,7 +17,7 @@ flowchart LR
 
 ## Usage
 
-### 1. Discover Tools
+### Discover Tools
 
 Call `m.help()` to print tool signatures and documentation formatted as Python function signatures:
 
@@ -66,7 +66,7 @@ list_items(*, category: str = None)
       category: Category filter
 ```
 
-### 2. Call Tools from Python
+### Call Tools from Python
 
 Connect to an HTTP URL or `stdio` command and call tools on `m.tools` using keyword arguments. Tool calls return parsed Python objects (`dict`, `list`, `str`) directly:
 
@@ -80,7 +80,7 @@ with sans_mcp.connect("python3 tests/mock_server.py") as m:
         print(f"{info['name']}: {info['status']}")
 ```
 
-### 3. Stdio-to-HTTP Proxy
+### Stdio-to-HTTP Proxy
 
 Run `python3 -m sans_mcp proxy` to expose a `stdio` MCP server as a Streamable HTTP endpoint (at `http://127.0.0.1:6270/mcp` by default):
 
@@ -98,6 +98,24 @@ with sans_mcp.connect("http://127.0.0.1:6270/mcp") as pw:
     pw.tools.browser_navigate(url="https://example.com")
     print(pw.tools.browser_snapshot())
 ```
+
+### HTTP Authentication
+
+To authenticate with remote HTTP MCP servers without placing credentials in CLI commands or Python scripts, configure per-host headers in `~/.config/sans-mcp/auth.json` (or `${XDG_CONFIG_HOME}/sans-mcp/auth.json`) with `0600` file permissions:
+
+```json
+{
+  "mcp.example.com": {
+    "Authorization": "Bearer ${EXAMPLE_MCP_TOKEN}"
+  }
+}
+```
+
+```bash
+chmod 600 ~/.config/sans-mcp/auth.json
+```
+
+`sans-mcp` matches the target URL's `hostname:port` or `hostname`, expands `${VAR}` references from the environment, and attaches the headers automatically during `sans-mcp help` and `sans_mcp.connect()`. Sending authentication headers over plaintext `http://` is blocked for non-loopback hosts.
 
 ## Installation
 

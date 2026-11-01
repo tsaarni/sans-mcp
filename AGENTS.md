@@ -3,9 +3,10 @@ Run these commands in order after modifying Python code (skip for documentation-
 ```bash
 uv run ruff format .
 uv run ruff check .
-uv run pytest -v
+uv run pytest -v --cov=sans_mcp --cov-report=term-missing
 ```
 
+- Check the `Missing` line numbers printed in the `pytest` output and add tests for any uncovered lines you added or modified.
 - Keep all library code in `sans_mcp.py` using only the Python standard library. Do not add external runtime dependencies.
 - Keep the public API surface minimal via `__all__` and prefix all internal functions and classes with `_`. `pytest` verifies public exports and signatures against `etc/api_surface.txt` (run `uv run pytest -v --update-api` for intentional API changes).
 - Do not preserve legacy APIs or shims solely for backward compatibility.
