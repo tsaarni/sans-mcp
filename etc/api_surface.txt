@@ -1,0 +1,7 @@
+class SansMCP:
+    tools: _ToolsProxy
+    def close(self) -> 'None'
+    def help(self, tool_name: 'str | None' = None) -> 'str'
+class SansMCPError(RuntimeError)
+def connect(target: 'str | list[str]', *, timeout: 'float' = 60.0, headers: 'dict[str, str] | None' = None, env: 'dict[str, str] | None' = None, cwd: 'str | None' = None) -> 'SansMCP'
+def main(argv: 'list[str] | None' = None) -> 'None'
