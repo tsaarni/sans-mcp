@@ -521,6 +521,8 @@ def _format_type(schema: dict[str, Any] | None, defs: dict[str, Any]) -> str:
     schema = _resolve_schema_ref(schema, defs)
 
     union_schemas = schema.get("anyOf") or schema.get("oneOf")
+    if not union_schemas and isinstance(schema.get("type"), list):
+        union_schemas = [{**schema, "type": t} for t in schema["type"]]
     if isinstance(union_schemas, list) and union_schemas:
         sub_types: list[str] = []
         has_null = False
@@ -531,7 +533,9 @@ def _format_type(schema: dict[str, Any] | None, defs: dict[str, Any]) -> str:
                 formatted = _format_type(s, defs)
                 if formatted not in sub_types:
                     sub_types.append(formatted)
-        base = " | ".join(sub_types) if sub_types else "Any"
+        if not sub_types:
+            return "None" if has_null else "Any"
+        base = " | ".join(sub_types)
         return f"{base} | None" if has_null else base
 
     enum_vals = schema.get("enum")
@@ -651,7 +655,7 @@ def _build_tool_spec(tool_dict: dict[str, Any], py_name: str) -> _ToolSpec:
         py_to_wire_params=py_to_wire,
         required_py_params=required_py,
         return_type=return_type,
-        closed_properties=input_schema.get("additionalProperties") is not True,
+        closed_properties=input_schema.get("additionalProperties") is False,
         wraps_result=wraps_result,
         signature=sig,
         help_text="\n".join(lines),
@@ -857,6 +861,8 @@ def _create_proxy_server(
                 cached_tools_res = {"tools": _fetch_tools(transport)}
             return cached_tools_res
 
+    # The proxy detects tool changes only while making stdio requests.
+    # SansMCP loads tool definitions once, when connecting.
     transport.on_list_changed = invalidate_tools
     cached_init_result = _initialize_mcp(transport, client_name="sans-mcp-gateway")
     initial_tools = get_tools_res()

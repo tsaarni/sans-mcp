@@ -225,6 +225,7 @@ class MockTransport:
                             "name": "calc-sum",
                             "inputSchema": {
                                 "type": "object",
+                                "additionalProperties": False,
                                 "required": ["a", "b"],
                                 "properties": {
                                     "a": {"type": "integer"},
@@ -278,6 +279,36 @@ def test_sans_mcp_client_validation():
     # 6. Correct call
     res = m.tools.calc_sum(a=5, b=7)
     assert res == "12"
+
+
+@pytest.mark.parametrize("additional", [None, True, {"type": "integer"}])
+def test_client_accepts_additional_arguments_and_nullable_types(additional):
+    class FlexibleTransport(MockTransport):
+        def request(self, method, params=None):
+            if method == "tools/list":
+                schema = {
+                    "type": "object",
+                    "properties": {"value": {"type": ["string", "null"]}},
+                }
+                if additional is not None:
+                    schema["additionalProperties"] = additional
+                return {"result": {"tools": [{"name": "flexible", "inputSchema": schema}]}}
+            if method == "tools/call":
+                return {"result": {"structuredContent": params["arguments"]}}
+            return super().request(method, params)
+
+    with SansMCP(FlexibleTransport()) as client:
+        assert "value: str | None" in client.help("flexible")
+        assert client.tools.flexible(value=None, extra=42) == {"value": None, "extra": 42}
+
+
+def test_format_type_type_arrays():
+    assert _format_type({"type": ["string", "integer"]}, {}) == "str | int"
+    assert _format_type({"type": ["null", "string"]}, {}) == "str | None"
+    assert _format_type({"type": ["null"]}, {}) == "None"
+    assert _format_type({"type": ["array", "null"], "items": {"type": "integer"}}, {}) == (
+        "list[int] | None"
+    )
 
 
 MOCK_SERVER_SCRIPT = str(pathlib.Path(__file__).parent / "mock_server.py")
