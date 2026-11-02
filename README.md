@@ -1,13 +1,17 @@
 ![sans-mcp](assets/sans-mcp-logo-light.png#gh-light-mode-only)
 ![sans-mcp](assets/sans-mcp-logo-dark.png#gh-dark-mode-only)
 
-`sans-mcp` is a Python module that lets coding agents use Model Context Protocol (MCP) servers through ad-hoc Python scripts, without configuring an MCP client.
+`sans-mcp` is a Python module that lets coding agents use Model Context Protocol (MCP) servers through ad-hoc Python scripts with a high-level API focused on tool discovery and calls.
 
+The module provides the following features:
+
+- **No agent configuration:** Works without the coding agent's built-in MCP client.
 - **On-demand discovery:** The coding agent can discover tool descriptions on demand, without polluting the context before they are needed.
 - **In-memory data processing:** The coding agent can process responses and chain multiple tool calls in a single Python script all in one go, without requiring an LLM round-trip for each step.
-- **No agent configuration:** Connects directly to any MCP server from Python scripts without configuring client settings or restarting the agent.
 - **Stdio-to-HTTP proxy:** Converts stdio MCP servers to Streamable HTTP endpoints.
 - **Single-file module with no dependencies:** Uses only the Python standard library.
+
+A downside is that each Python script reconnects to the MCP server and fetches the tool list again, though this is generally fast and happens internally without being visible to the LLM.
 
 ![sans-mcp architecture diagram](assets/sans-mcp-diagram-light.png#gh-light-mode-only)
 ![sans-mcp architecture diagram](assets/sans-mcp-diagram-dark.png#gh-dark-mode-only)
@@ -16,7 +20,7 @@
 
 ### Discover Tools
 
-Call `m.help()` to print tool signatures and documentation formatted as Python function signatures:
+On first use, call `m.help()` to print tool signatures and documentation formatted as Python function signatures:
 
 ```python
 import sans_mcp

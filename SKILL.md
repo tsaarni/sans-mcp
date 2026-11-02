@@ -6,7 +6,7 @@ description: Use when calling or inspecting MCP servers from Python.
 ```python
 import sans_mcp
 
-# 1. Discover available tools and signatures
+# 1. Discover available tools and signatures on first use
 with sans_mcp.connect("http://127.0.0.1:8000/mcp") as m:
     print(m.help())
     # Or inspect a specific tool:
