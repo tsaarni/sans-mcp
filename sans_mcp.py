@@ -484,11 +484,11 @@ class _HttpTransport:
                         f"HTTP {e.code} connecting to '{self.url}': Server may require legacy MCP SSE "
                         f"transport, which is deprecated in favor of Streamable HTTP ({err_body})"
                     ) from e
-                raise SansMCPError(f"HTTP {e.code} error {label}: {err_body}") from e
+                raise SansMCPError(f"HTTP {e.code} from '{self.url}' {label}: {err_body}") from e
             except urllib.error.URLError as e:
-                raise SansMCPError(f"Failed to connect to '{self.url}': {e.reason}") from e
+                raise SansMCPError(f"Failed to connect to '{self.url}' {label}: {e.reason}") from e
             except (http.client.HTTPException, OSError, json.JSONDecodeError) as e:
-                raise SansMCPError(f"Error communicating with '{self.url}': {e}") from e
+                raise SansMCPError(f"Error communicating with '{self.url}' {label}: {e}") from e
 
     def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         req_id = next(self._id_counter)
@@ -795,10 +795,13 @@ class SansMCP:
     def _call_tool(
         self, wire_name: str, wire_arguments: dict[str, Any], wraps_result: bool = False
     ) -> Any:
-        res = self._transport.request(
-            "tools/call",
-            {"name": wire_name, "arguments": wire_arguments},
-        )
+        try:
+            res = self._transport.request(
+                "tools/call",
+                {"name": wire_name, "arguments": wire_arguments},
+            )
+        except SansMCPError as e:
+            raise SansMCPError(f"Tool '{wire_name}' failed: {e}") from e
         return _unwrap_result(wire_name, res, wraps_result=wraps_result)
 
     def help(self, tool_name: str | None = None) -> str:

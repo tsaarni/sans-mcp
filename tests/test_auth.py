@@ -300,7 +300,7 @@ def test_http_error_when_body_read_resets(monkeypatch, tmp_path):
 
     with (
         patch.object(transport._opener, "open", side_effect=mock_err),
-        pytest.raises(SansMCPError, match="HTTP 401 error calling 'initialize': Unauthorized"),
+        pytest.raises(SansMCPError, match=r"HTTP 401 from .* calling 'initialize': Unauthorized"),
     ):
         transport.request("initialize", {})
 
@@ -308,7 +308,7 @@ def test_http_error_when_body_read_resets(monkeypatch, tmp_path):
         patch.object(transport._opener, "open", side_effect=mock_err),
         pytest.raises(
             SansMCPError,
-            match="HTTP 401 error in notification 'notifications/initialized': Unauthorized",
+            match=r"HTTP 401 from .* in notification 'notifications/initialized': Unauthorized",
         ),
     ):
         transport.notify("notifications/initialized", {})

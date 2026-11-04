@@ -932,3 +932,82 @@ def test_run_proxy_lifecycle_and_cli_error_paths(monkeypatch, capsys):
     with pytest.raises(SystemExit) as exc_info:
         runpy.run_path(sans_mcp.__file__, run_name="__main__")
     assert exc_info.value.code == 1
+
+
+@pytest.mark.parametrize(
+    ("method", "params", "operation"),
+    [
+        ("initialize", {}, "calling 'initialize'"),
+        ("tools/list", {}, "calling 'tools/list'"),
+        (
+            "tools/call",
+            {"name": "take_snapshot", "arguments": {"pageId": 2}},
+            "calling 'tools/call'",
+        ),
+    ],
+)
+def test_http_server_error_context(monkeypatch, tmp_path, method, params, operation):
+    import io
+    import urllib.error
+    from unittest.mock import patch
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    url = "http://127.0.0.1:5420/devtools-mcp"
+    body = '{"jsonrpc":"2.0","error":{"code":-32603,"message":"Internal server error"},"id":null}'
+    error = urllib.error.HTTPError(url, 500, "Internal Server Error", {}, io.BytesIO(body.encode()))
+    transport = sans_mcp._HttpTransport(url)
+    with (
+        patch.object(transport._opener, "open", side_effect=error),
+        pytest.raises(SansMCPError) as exc,
+    ):
+        transport.request(method, params)
+    assert str(exc.value) == f"HTTP 500 from '{url}' {operation}: {body}"
+    assert exc.value.__cause__ is error
+
+
+@pytest.mark.parametrize("failure", ["connect", "disconnect", "json"])
+def test_http_communication_error_context(monkeypatch, tmp_path, failure):
+    import http.client
+    import json
+    import urllib.error
+    from unittest.mock import patch
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    url = "http://127.0.0.1:5420/devtools-mcp"
+    errors = {
+        "connect": urllib.error.URLError("Connection refused"),
+        "disconnect": http.client.RemoteDisconnected("Remote closed"),
+        "json": json.JSONDecodeError("Invalid JSON", "x", 0),
+    }
+    transport = sans_mcp._HttpTransport(url)
+    with (
+        patch.object(transport._opener, "open", side_effect=errors[failure]),
+        pytest.raises(SansMCPError) as exc,
+    ):
+        transport.request("tools/call", {"name": "take_snapshot"})
+    assert url in str(exc.value)
+    assert "calling 'tools/call'" in str(exc.value)
+    assert exc.value.__cause__ is errors[failure]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "HTTP 500 from 'http://localhost/mcp' calling 'tools/call': Internal server error",
+        "Failed to connect to 'http://localhost/mcp' calling 'tools/call': Connection refused",
+        "Subprocess terminated unexpectedly",
+    ],
+)
+def test_tool_transport_error_context(message):
+    from unittest.mock import patch
+
+    transport = MockTransport()
+    client = SansMCP(transport)
+    error = SansMCPError(message)
+    with (
+        patch.object(transport, "request", side_effect=error),
+        pytest.raises(SansMCPError) as exc,
+    ):
+        client.tools.calc_sum(a=1, b=2)
+    assert str(exc.value) == f"Tool 'calc-sum' failed: {message}"
+    assert exc.value.__cause__ is error
