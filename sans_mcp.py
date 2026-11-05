@@ -19,6 +19,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -73,12 +74,23 @@ def _build_ident_map(raw_names: list[str]) -> dict[str, str]:
     return mapping
 
 
+def _format_rpc_error(err: Any) -> str:
+    if not isinstance(err, dict):
+        return str(err)
+    msg = str(err.get("message", err))
+    if "code" in err:
+        msg += f" (code {err['code']})"
+    if "data" in err:
+        msg += f"; data: {json.dumps(err['data'], ensure_ascii=False)}"
+    return msg
+
+
 def _unwrap_result(name: str, rpc_response: dict[str, Any], wraps_result: bool = False) -> Any:
     """Unwrap MCP JSON-RPC response envelope into idiomatic Python types or raise SansMCPError."""
     if "error" in rpc_response:
-        err = rpc_response["error"]
-        msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-        raise SansMCPError(f"RPC error calling '{name}': {msg}")
+        raise SansMCPError(
+            f"RPC error calling '{name}': {_format_rpc_error(rpc_response['error'])}"
+        )
 
     result = rpc_response.get("result", {})
     if not isinstance(result, dict):
@@ -190,19 +202,20 @@ class _StdioTransport:
                 {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params or {}}
             )
 
+            deadline = time.monotonic() + self.timeout
+            invalid_count = 0
+            first_invalid = ""
             while True:
                 try:
-                    line = self._queue.get(timeout=self.timeout)
+                    line = self._queue.get(timeout=max(0, deadline - time.monotonic()))
                 except queue.Empty:
-                    raise SansMCPError(
-                        f"Request '{method}' (id={req_id}) timed out after {self.timeout}s"
-                    ) from None
+                    error = f"Request '{method}' (id={req_id}) timed out after {self.timeout}s"
+                    break
 
                 if line is None:
                     code = self._process.poll()
-                    raise SansMCPError(
-                        f"Subprocess terminated (exit code {code}) while awaiting response for '{method}'"
-                    )
+                    error = f"Subprocess terminated (exit code {code}) while awaiting response for '{method}'"
+                    break
 
                 stripped = line.strip()
                 if not stripped:
@@ -211,9 +224,11 @@ class _StdioTransport:
                 try:
                     data = json.loads(stripped)
                 except json.JSONDecodeError:
-                    continue
+                    data = None
 
                 if not isinstance(data, dict):
+                    invalid_count += 1
+                    first_invalid = first_invalid or stripped[:200]
                     continue
 
                 if data.get("method") == "ping" and "id" in data:
@@ -234,6 +249,10 @@ class _StdioTransport:
 
                 if data.get("id") == req_id:
                     return data
+
+            if invalid_count:
+                error += f"; discarded {invalid_count} malformed stdout line(s), first: {first_invalid!r}"
+            raise SansMCPError(error)
 
     def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
         with self._lock:
@@ -393,6 +412,19 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         return new_req
 
 
+def _validate_response(response: Any, req_id: Any, context: str) -> dict[str, Any]:
+    if not isinstance(response, dict) or ("result" in response) == ("error" in response):
+        reason = "expected exactly one of result or error"
+    elif response.get("id") == req_id or (response.get("id") is None and "error" in response):
+        return response
+    else:
+        reason = f"expected id={req_id}, received id={response.get('id')!r}"
+    sample = json.dumps(response, ensure_ascii=False)[:200]
+    raise SansMCPError(
+        f"Invalid JSON-RPC response: {reason}; {context}; response starts: {sample!r}"
+    )
+
+
 class _HttpTransport:
     """Streamable HTTP transport handling JSON and SSE chunks with session tracking."""
 
@@ -438,7 +470,7 @@ class _HttpTransport:
                 with contextlib.suppress(json.JSONDecodeError):
                     data = json.loads(chunk)
                     if isinstance(data, dict) and data.get("id") == target_id:
-                        return data
+                        return _validate_response(data, target_id, f"SSE request id={target_id}")
         raise SansMCPError(f"SSE stream ended without response for request id={target_id}")
 
     def _send(
@@ -471,9 +503,20 @@ class _HttpTransport:
                         return self._parse_sse_response(resp, req_id)
 
                     resp_bytes = resp.read()
+                    context = (
+                        f"HTTP {resp.status}, {content_type or 'missing Content-Type'} "
+                        f"from '{self.url}' {label} (request id={req_id})"
+                    )
                     if not resp_bytes:
-                        return {"jsonrpc": "2.0", "id": req_id, "result": {}}
-                    return json.loads(resp_bytes.decode("utf-8"))
+                        raise SansMCPError(f"Empty response: {context}")
+                    try:
+                        response = json.loads(resp_bytes)
+                    except ValueError as e:
+                        sample = resp_bytes[:200].decode("utf-8", errors="replace")
+                        raise SansMCPError(
+                            f"Expected JSON-RPC response: {context}; body starts: {sample!r}"
+                        ) from e
+                    return _validate_response(response, req_id, context)
             except urllib.error.HTTPError as e:
                 try:
                     err_body = e.read().decode("utf-8", errors="replace")
@@ -487,7 +530,7 @@ class _HttpTransport:
                 raise SansMCPError(f"HTTP {e.code} from '{self.url}' {label}: {err_body}") from e
             except urllib.error.URLError as e:
                 raise SansMCPError(f"Failed to connect to '{self.url}' {label}: {e.reason}") from e
-            except (http.client.HTTPException, OSError, json.JSONDecodeError) as e:
+            except (http.client.HTTPException, OSError) as e:
                 raise SansMCPError(f"Error communicating with '{self.url}' {label}: {e}") from e
 
     def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -694,7 +737,9 @@ def _initialize_mcp(transport: Any, client_name: str = "sans-mcp") -> dict[str, 
         },
     )
     if "error" in init_res:
-        raise SansMCPError(f"Initialization handshake failed: {init_res['error']}")
+        raise SansMCPError(
+            f"Initialization handshake failed: {_format_rpc_error(init_res['error'])}"
+        )
     transport.notify("notifications/initialized", {})
     return init_res.get("result", {})
 
@@ -705,7 +750,7 @@ def _fetch_tools(transport: Any) -> list[dict[str, Any]]:
     while True:
         res = transport.request("tools/list", {"cursor": cursor} if cursor else {})
         if "error" in res:
-            raise SansMCPError(f"Failed to list tools: {res['error']}")
+            raise SansMCPError(f"Failed to list tools: {_format_rpc_error(res['error'])}")
         result = res.get("result", {})
         all_tools.extend(result.get("tools", []))
         cursor = result.get("nextCursor")

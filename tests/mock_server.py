@@ -3,6 +3,7 @@
 
 import json
 import sys
+import time
 
 
 def handle_request(req: dict) -> dict | None:
@@ -172,12 +173,33 @@ def handle_request(req: dict) -> dict | None:
 
 
 def main() -> None:
+    # Optional fault mode for exercising client error reporting.
+    fault = sys.argv[1] if len(sys.argv) > 1 else None
     for line in sys.stdin:
         line = line.strip()
         if not line:
             continue
         req = json.loads(line)
+        if fault == "noise":
+            print("INFO: server starting", flush=True)
+            continue
+        if fault == "crash":
+            print("Error: missing API_KEY", flush=True)
+            sys.exit(1)
+        while fault == "chatty":
+            print(json.dumps({"jsonrpc": "2.0", "method": "notifications/progress"}), flush=True)
+            time.sleep(0.05)
         resp = handle_request(req)
+        if fault == "rpc-error" and req.get("method") == "tools/call":
+            resp = {
+                "jsonrpc": "2.0",
+                "id": req.get("id"),
+                "error": {
+                    "code": -32602,
+                    "message": "Invalid params",
+                    "data": {"field": "user-name"},
+                },
+            }
         if resp is not None:
             sys.stdout.write(json.dumps(resp) + "\n")
             sys.stdout.flush()

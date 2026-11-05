@@ -695,15 +695,6 @@ def test_http_transport_sse_and_network_errors(monkeypatch, tmp_path):
     ):
         transport._parse_sse_response(empty_sse.readlines(), target_id=42)
 
-    # Empty JSON body returns empty result dict
-    empty_json_resp = MagicMock()
-    empty_json_resp.__enter__.return_value = empty_json_resp
-    empty_json_resp.headers = {"Content-Type": "application/json"}
-    empty_json_resp.read.return_value = b""
-    with patch.object(transport._opener, "open", return_value=empty_json_resp):
-        res2 = transport.request("empty_body")
-        assert res2["result"] == {}
-
     # URLError and RemoteDisconnected are wrapped in SansMCPError
     with (
         patch.object(
@@ -965,10 +956,9 @@ def test_http_server_error_context(monkeypatch, tmp_path, method, params, operat
     assert exc.value.__cause__ is error
 
 
-@pytest.mark.parametrize("failure", ["connect", "disconnect", "json"])
+@pytest.mark.parametrize("failure", ["connect", "disconnect"])
 def test_http_communication_error_context(monkeypatch, tmp_path, failure):
     import http.client
-    import json
     import urllib.error
     from unittest.mock import patch
 
@@ -977,7 +967,6 @@ def test_http_communication_error_context(monkeypatch, tmp_path, failure):
     errors = {
         "connect": urllib.error.URLError("Connection refused"),
         "disconnect": http.client.RemoteDisconnected("Remote closed"),
-        "json": json.JSONDecodeError("Invalid JSON", "x", 0),
     }
     transport = sans_mcp._HttpTransport(url)
     with (
@@ -1011,3 +1000,94 @@ def test_tool_transport_error_context(message):
         client.tools.calc_sum(a=1, b=2)
     assert str(exc.value) == f"Tool 'calc-sum' failed: {message}"
     assert exc.value.__cause__ is error
+
+
+@pytest.mark.parametrize(
+    ("fault", "expected"),
+    [
+        (
+            "noise",
+            "timed out after 0.5s; discarded 1 malformed stdout line(s), first: 'INFO: server starting'",
+        ),
+        (
+            "crash",
+            "awaiting response for 'initialize'; discarded 1 malformed stdout line(s), first: 'Error: missing API_KEY'",
+        ),
+        ("chatty", "Request 'initialize' (id=1) timed out after 0.5s"),
+    ],
+)
+def test_stdio_failures_report_server_output(fault, expected):
+    with pytest.raises(SansMCPError) as exc:
+        connect([*MOCK_SERVER_CMD, fault], timeout=0.5)
+    assert expected in str(exc.value)
+
+
+def test_rpc_error_reports_code_and_data():
+    with connect([*MOCK_SERVER_CMD, "rpc-error"]) as m, pytest.raises(SansMCPError) as exc:
+        m.tools.greet_user(user_name="Alice")
+    assert str(exc.value) == (
+        'RPC error calling \'greet-user\': Invalid params (code -32602); data: {"field": "user-name"}'
+    )
+
+
+@pytest.fixture
+def http_reply():
+    import http.server
+    import threading
+
+    servers = []
+
+    def serve(body: bytes, content_type: str = "application/json") -> str:
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        servers.append(server)
+        return f"http://127.0.0.1:{server.server_port}/mcp"
+
+    yield serve
+    for server in servers:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.parametrize(
+    ("body", "content_type", "expected"),
+    [
+        (b"<html>Sign in</html>" + b"x" * 500, "text/html", "HTTP 200, text/html from"),
+        (b"\xff", "application/json", "body starts: '\ufffd'"),
+        (b"", "application/json", "Empty response: HTTP 200, application/json"),
+        (b'{"status": "ok"}', "application/json", "expected exactly one of result or error"),
+        (
+            b'{"jsonrpc": "2.0", "id": 7, "result": {}}',
+            "application/json",
+            "expected id=1, received id=7",
+        ),
+        (
+            b'{"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": "Bad version"}}',
+            "application/json",
+            "Initialization handshake failed: Bad version (code -32600)",
+        ),
+    ],
+)
+def test_http_invalid_responses_report_what_server_sent(http_reply, body, content_type, expected):
+    with pytest.raises(SansMCPError) as exc:
+        connect(http_reply(body, content_type))
+    assert expected in str(exc.value)
+    assert len(str(exc.value)) < 400
+
+
+def test_sse_rejects_invalid_matching_response():
+    transport = sans_mcp._HttpTransport("http://localhost/mcp")
+    with pytest.raises(SansMCPError, match="Invalid JSON-RPC response"):
+        transport._parse_sse_response([b'data: {"id":1}\n', b"\n"], target_id=1)
