@@ -1091,3 +1091,38 @@ def test_sse_rejects_invalid_matching_response():
     transport = sans_mcp._HttpTransport("http://localhost/mcp")
     with pytest.raises(SansMCPError, match="Invalid JSON-RPC response"):
         transport._parse_sse_response([b'data: {"id":1}\n', b"\n"], target_id=1)
+
+
+def test_http_transport_close_sends_delete_and_ignores_errors(monkeypatch, tmp_path):
+    import urllib.error
+    from unittest.mock import MagicMock, patch
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    transport = sans_mcp._HttpTransport(
+        "http://127.0.0.1:9999/mcp", headers={"Authorization": "Bearer tok"}
+    )
+    transport.session_id = "sess-42"
+
+    resp = MagicMock()
+    resp.__enter__.return_value = resp
+    with patch.object(transport._opener, "open", return_value=resp) as mock_open:
+        transport.close()
+        assert mock_open.call_count == 1
+        req = mock_open.call_args[0][0]
+        assert req.get_method() == "DELETE"
+        assert req.full_url == "http://127.0.0.1:9999/mcp"
+        assert req.get_header("Mcp-session-id") == "sess-42"
+        assert req.get_header("Authorization") == "Bearer tok"
+        assert mock_open.call_args.kwargs["timeout"] == 5.0
+        assert transport.session_id is None
+
+        # Second close is a no-op because session_id was cleared.
+        transport.close()
+        assert mock_open.call_count == 1
+
+    # Errors during DELETE (e.g. 405 Method Not Allowed) are suppressed.
+    transport.session_id = "sess-43"
+    err = urllib.error.HTTPError("http://127.0.0.1:9999/mcp", 405, "Method Not Allowed", {}, None)
+    with patch.object(transport._opener, "open", side_effect=err):
+        transport.close()
+    assert transport.session_id is None

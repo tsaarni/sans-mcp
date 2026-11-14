@@ -152,6 +152,7 @@ class _StdioTransport:
         self.command = command
         self.timeout = timeout
         self.on_list_changed = on_list_changed
+        # Required: ThreadingHTTPServer proxy shares one transport across worker threads.
         self._lock = threading.Lock()
         self._id_counter = itertools.count(1)
         self._queue: queue.Queue[str | None] = queue.Queue()
@@ -172,6 +173,7 @@ class _StdioTransport:
         except Exception as e:
             raise SansMCPError(f"Failed to spawn stdio MCP server {command!r}: {e}") from e
 
+        # Required: daemon reader enables portable queue.get(timeout=...) on stdout.
         self._reader_thread = threading.Thread(target=self._read_stdout, daemon=True)
         self._reader_thread.start()
         atexit.register(self.close)
@@ -458,9 +460,9 @@ class _HttpTransport:
                     f"Use HTTPS or set SANS_MCP_ALLOW_INSECURE_HTTP=1 to allow it"
                 )
 
+        # No lock: _HttpTransport is single-threaded and not used by the proxy.
         self.session_id: str | None = None
         self._id_counter = itertools.count(1)
-        self._lock = threading.Lock()
         self._opener = urllib.request.build_opener(_SafeRedirectHandler())
 
     def _parse_sse_response(self, resp: Any, target_id: Any) -> dict[str, Any]:
@@ -481,62 +483,59 @@ class _HttpTransport:
     def _send(
         self, payload: dict[str, Any], req_id: int | None = None, label: str = ""
     ) -> dict[str, Any]:
-        with self._lock:
-            body_bytes = json.dumps(payload).encode("utf-8")
-            req_headers = {
-                "Content-Type": "application/json",
-                "Accept": "application/json, text/event-stream",
-                **self.custom_headers,
-            }
-            if self.session_id:
-                req_headers["mcp-session-id"] = self.session_id
+        body_bytes = json.dumps(payload).encode("utf-8")
+        req_headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            **self.custom_headers,
+        }
+        if self.session_id:
+            req_headers["mcp-session-id"] = self.session_id
 
-            req = urllib.request.Request(
-                self.url, data=body_bytes, headers=req_headers, method="POST"
-            )
-            try:
-                with self._opener.open(req, timeout=self.timeout) as resp:
-                    for h_name, h_val in resp.headers.items():
-                        if h_name.lower() == "mcp-session-id":
-                            self.session_id = h_val
+        req = urllib.request.Request(self.url, data=body_bytes, headers=req_headers, method="POST")
+        try:
+            with self._opener.open(req, timeout=self.timeout) as resp:
+                for h_name, h_val in resp.headers.items():
+                    if h_name.lower() == "mcp-session-id":
+                        self.session_id = h_val
 
-                    if req_id is None:
-                        return {}
+                if req_id is None:
+                    return {}
 
-                    content_type = resp.headers.get("Content-Type", "")
-                    if "text/event-stream" in content_type:
-                        return self._parse_sse_response(resp, req_id)
+                content_type = resp.headers.get("Content-Type", "")
+                if "text/event-stream" in content_type:
+                    return self._parse_sse_response(resp, req_id)
 
-                    resp_bytes = resp.read()
-                    context = (
-                        f"HTTP {resp.status}, {content_type or 'missing Content-Type'} "
-                        f"from '{self.url}' {label} (request id={req_id})"
-                    )
-                    if not resp_bytes:
-                        raise SansMCPError(f"Empty response: {context}")
-                    try:
-                        response = json.loads(resp_bytes)
-                    except ValueError as e:
-                        sample = resp_bytes[:200].decode("utf-8", errors="replace")
-                        raise SansMCPError(
-                            f"Expected JSON-RPC response: {context}; body starts: {sample!r}"
-                        ) from e
-                    return _validate_response(response, req_id, context)
-            except urllib.error.HTTPError as e:
+                resp_bytes = resp.read()
+                context = (
+                    f"HTTP {resp.status}, {content_type or 'missing Content-Type'} "
+                    f"from '{self.url}' {label} (request id={req_id})"
+                )
+                if not resp_bytes:
+                    raise SansMCPError(f"Empty response: {context}")
                 try:
-                    err_body = e.read().decode("utf-8", errors="replace")
-                except OSError:
-                    err_body = str(e.reason)
-                if e.code in (404, 405) and "/sse" in self.url:
+                    response = json.loads(resp_bytes)
+                except ValueError as e:
+                    sample = resp_bytes[:200].decode("utf-8", errors="replace")
                     raise SansMCPError(
-                        f"HTTP {e.code} connecting to '{self.url}': Server may require legacy MCP SSE "
-                        f"transport, which is deprecated in favor of Streamable HTTP ({err_body})"
+                        f"Expected JSON-RPC response: {context}; body starts: {sample!r}"
                     ) from e
-                raise SansMCPError(f"HTTP {e.code} from '{self.url}' {label}: {err_body}") from e
-            except urllib.error.URLError as e:
-                raise SansMCPError(f"Failed to connect to '{self.url}' {label}: {e.reason}") from e
-            except (http.client.HTTPException, OSError) as e:
-                raise SansMCPError(f"Error communicating with '{self.url}' {label}: {e}") from e
+                return _validate_response(response, req_id, context)
+        except urllib.error.HTTPError as e:
+            try:
+                err_body = e.read().decode("utf-8", errors="replace")
+            except OSError:
+                err_body = str(e.reason)
+            if e.code in (404, 405) and "/sse" in self.url:
+                raise SansMCPError(
+                    f"HTTP {e.code} connecting to '{self.url}': Server may require legacy MCP SSE "
+                    f"transport, which is deprecated in favor of Streamable HTTP ({err_body})"
+                ) from e
+            raise SansMCPError(f"HTTP {e.code} from '{self.url}' {label}: {err_body}") from e
+        except urllib.error.URLError as e:
+            raise SansMCPError(f"Failed to connect to '{self.url}' {label}: {e.reason}") from e
+        except (http.client.HTTPException, OSError) as e:
+            raise SansMCPError(f"Error communicating with '{self.url}' {label}: {e}") from e
 
     def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         req_id = next(self._id_counter)
@@ -548,7 +547,19 @@ class _HttpTransport:
         self._send(payload, req_id=None, label=f"in notification '{method}'")
 
     def close(self) -> None:
-        pass
+        if not self.session_id:
+            return
+        session_id, self.session_id = self.session_id, None
+        req = urllib.request.Request(
+            self.url,
+            headers={**self.custom_headers, "mcp-session-id": session_id},
+            method="DELETE",
+        )
+        with (
+            contextlib.suppress(http.client.HTTPException, OSError),
+            self._opener.open(req, timeout=min(self.timeout, 5.0)),
+        ):
+            pass
 
 
 def _resolve_schema_ref(schema: dict[str, Any], defs: dict[str, Any]) -> dict[str, Any]:
@@ -900,6 +911,7 @@ def _create_proxy_server(
     host: str, port: int, transport: Any
 ) -> tuple[http.server.ThreadingHTTPServer, dict[str, Any]]:
     """Initialize MCP session on transport and return a configured ThreadingHTTPServer."""
+    # Required: ThreadingHTTPServer worker threads share cached_tools_res.
     tools_lock = threading.Lock()
     cached_tools_res: dict[str, Any] | None = None
 
@@ -1029,6 +1041,7 @@ def _run_proxy(host: str, port: int, command: list[str]) -> None:
 
     def shutdown_signal(sig: int, frame: Any) -> None:
         print("\n[sans-mcp] Shutting down proxy...", file=sys.stderr)
+        # Required: BaseServer.shutdown() deadlocks if called on the serve_forever() thread.
         threading.Thread(target=httpd.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGINT, shutdown_signal)
