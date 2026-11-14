@@ -132,6 +132,7 @@ def test_auth_config_invalid_json_and_schema(monkeypatch, tmp_path):
 
 def test_http_transport_rejects_cleartext_auth_on_remote_host(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv("SANS_MCP_ALLOW_INSECURE_HTTP", raising=False)
     _write_auth_config(tmp_path, '{"remote.example.com": {"Authorization": "Bearer tok"}}')
 
     with pytest.raises(
@@ -145,6 +146,21 @@ def test_http_transport_rejects_cleartext_auth_on_remote_host(monkeypatch, tmp_p
         "http://127.0.0.1:8000/mcp", headers={"Authorization": "Bearer local-tok"}
     )
     assert t.custom_headers == {"Authorization": "Bearer local-tok"}
+
+
+def test_allow_insecure_http_env_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    _write_auth_config(tmp_path, '{"remote.example.com": {"Authorization": "Bearer tok"}}')
+
+    # SANS_MCP_ALLOW_INSECURE_HTTP=1 allows auth headers over plaintext HTTP
+    monkeypatch.setenv("SANS_MCP_ALLOW_INSECURE_HTTP", "1")
+    t = sans_mcp._HttpTransport("http://remote.example.com/mcp")
+    assert t.custom_headers == {"Authorization": "Bearer tok"}
+
+    # Any other value keeps the default refusal
+    monkeypatch.setenv("SANS_MCP_ALLOW_INSECURE_HTTP", "true")
+    with pytest.raises(SansMCPError, match="Refusing to send authentication headers"):
+        sans_mcp._HttpTransport("http://remote.example.com/mcp")
 
 
 def test_safe_redirect_handler():

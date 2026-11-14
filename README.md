@@ -112,7 +112,7 @@ To authenticate with remote HTTP MCP servers without placing credentials in CLI 
 
 ```json
 {
-  "mcp.example.com": {
+  "mcp.example.com:8000": {
     "Authorization": "Bearer ${EXAMPLE_MCP_TOKEN}"
   }
 }
@@ -123,6 +123,8 @@ chmod 600 ~/.config/sans-mcp/auth.json
 ```
 
 `sans-mcp` matches the target URL's `hostname:port` or `hostname`, expands `${VAR}` references from the environment, and attaches the headers automatically during `sans-mcp help` and `sans_mcp.connect()`.
+
+By default `sans-mcp` refuses to send authentication headers over plaintext HTTP to non-loopback hosts. Set `SANS_MCP_ALLOW_INSECURE_HTTP=1` to allow it on trusted networks.
 
 ## Installation
 

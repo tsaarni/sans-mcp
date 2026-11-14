@@ -447,10 +447,15 @@ class _HttpTransport:
 
         if self.custom_headers:
             parsed = urllib.parse.urlsplit(url)
-            if parsed.scheme.lower() != "https" and not _is_loopback_host(parsed.hostname or ""):
+            if (
+                parsed.scheme.lower() != "https"
+                and not _is_loopback_host(parsed.hostname or "")
+                and os.environ.get("SANS_MCP_ALLOW_INSECURE_HTTP") != "1"
+            ):
                 raise SansMCPError(
                     f"Refusing to send authentication headers over plaintext HTTP "
-                    f"to non-loopback host '{parsed.hostname}'"
+                    f"to non-loopback host '{parsed.hostname}'. "
+                    f"Use HTTPS or set SANS_MCP_ALLOW_INSECURE_HTTP=1 to allow it"
                 )
 
         self.session_id: str | None = None
